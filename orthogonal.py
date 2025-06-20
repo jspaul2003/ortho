@@ -42,7 +42,8 @@ Returns:
 def ensemble_defect_pair(seq1, seq2, model, structure):
     P = nu.pairs(strands=[seq1, seq2], model=model).to_array()
     S = nu.Structure(structure).matrix()
-    return  (len(seq1) - (P*S).sum())/len(seq1)
+    n = len(seq1) * 2
+    return  (n - (P*S).sum())/n
 
 """ 
 Compute ensemble defect of a structure for a single sequence. 
@@ -58,7 +59,8 @@ Returns:
 def ensemble_defect_sole(seq1, model, structure):
     P = nu.pairs(strands=[seq1], model=model).to_array()
     S = nu.Structure(structure).matrix()
-    return  (len(seq1) - (P*S).sum())/len(seq1)
+    n = len(seq1) 
+    return  (n - (P*S).sum())/n
 
 """
 Compute ensemble defects for on target structures.  
@@ -144,7 +146,7 @@ def np_diag_ensemble(seq1, model, duplex):
         return [o1]
 
 """ 
-Helper function for ensemble_matrix_mp.
+Helper function for ensemble_matrix_mp and ensemble_matrix_no_mp.
 
 Computes a row of the off-target ensemble matrix for a given sequence. 
 The off-target ensemble matrix is a matrix where each row/column index represents a 
@@ -187,7 +189,9 @@ def ensemble_row_worker(args):
     return i, row[i:], on_p  # return upper triangle 
 
 """
-Generates the off-target probability matrix and the on-target binding probability array. 
+Generates the off-target probability matrix and the on-target binding probability array.
+Uses multiprocessing. 
+
 For the off-target matrix: 
     each entry [i,j] represents the maximum probability of a given off-target complex
     possible when seq i is exposed to j. (Self off-targets are only considered in the 
@@ -221,6 +225,43 @@ def ensemble_matrix_mp(library, model, ncores, duplex):
             off_target_ensemble[i, i:] = row_slice
             off_target_ensemble[i+1:, i] = row_slice[1:]  #fill lower triangle by symmetry
             on_target_ensemble[i] = on_t
+
+    return off_target_ensemble, on_target_ensemble
+
+"""
+Generates the off-target probability matrix and the on-target binding probability array.
+Does not use multiprocessing. 
+
+For the off-target matrix: 
+    each entry [i,j] represents the maximum probability of a given off-target complex
+    possible when seq i is exposed to j. (Self off-targets are only considered in the 
+    diagonal entries.)
+    
+For the on-target binding probability array:
+    each entry [i] represents the probability of on-target binding of seq i with its 
+    reverse complement.
+
+Args:
+    library: list of seqs
+    model: nupack conditions
+    conc: molar concentrations of strands
+    ncores: number of cores to use for parallel processing
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+
+Returns:
+    np_probs: NxN numpy array off-target probability matrix (N is the size of the library)
+    on_probs: length N numpy array on-target binding probability array
+"""
+def ensemble_matrix_no_mp(library, model, duplex):
+    size = len(library)
+    off_target_ensemble = np.zeros((size, size))
+    on_target_ensemble = np.zeros(size)
+
+    for i in range(size):
+        i, row_slice, on_t = ensemble_row_worker((library, model, i, duplex))
+        off_target_ensemble[i, i:] = row_slice
+        off_target_ensemble[i+1:, i] = row_slice[1:]  #fill lower triangle by symmetry
+        on_target_ensemble[i] = on_t
 
     return off_target_ensemble, on_target_ensemble
 
@@ -528,7 +569,7 @@ def np_crosstalk_tm(seq1, seq2, t, conc=1e-8):
         return [0.0]  # Returning zero as a fallback value
 
 """ 
-Helper function for nupack_matrix_mp.
+Helper function for nupack_matrix_mp and nupack_matrix_no_mp.
  
 Computes a row of the np_probs matrix for a given sequence. np_probs is a matrix where 
 each row/column index represents a sequence in the library. Each entry in np_probs 
@@ -574,6 +615,8 @@ def row_worker(args):
 
 """
 Generates the off-target probability matrix and the on-target binding probability array. 
+Uses multiprocessing. 
+
 For the off-target matrix: 
     each entry [i,j] represents the maximum probability of a given off-target complex
     possible when seq i is exposed to j. (Self off-targets are only considered in the 
@@ -608,6 +651,41 @@ def nupack_matrix_mp(library, model, conc, ncores, duplex):
             np_probs[i+1:, i] = row_slice[1:]  # fill lower triangle by symmetry
             on_probs[i] = on_t
 
+    return np_probs, on_probs
+
+"""
+Generates the off-target probability matrix and the on-target binding probability array. 
+Does not use multiprocessing. 
+
+For the off-target matrix: 
+    each entry [i,j] represents the maximum probability of a given off-target complex
+    possible when seq i is exposed to j. (Self off-targets are only considered in the 
+    diagonal entries.)
+    
+For the on-target binding probability array:
+    each entry [i] represents the probability of on-target binding of seq i with its 
+    reverse complement.
+
+Args:
+    library: list of seqs
+    model: nupack conditions
+    conc: molar concentrations of strands
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+
+Returns:
+    np_probs: NxN numpy array off-target probability matrix (N is the size of the library)
+    on_probs: length N numpy array on-target binding probability array
+"""
+def nupack_matrix_no_mp(library, model, conc, duplex):
+    size = len(library)
+    np_probs = np.zeros((size, size))
+    on_probs = np.zeros(size)
+
+    for i in range(size):
+        i, row_slice, on_t = row_worker((library, model, conc, i, duplex))
+        np_probs[i, i:] = row_slice
+        np_probs[i+1:, i] = row_slice[1:]  # fill lower triangle by symmetry
+        on_probs[i] = on_t
     return np_probs, on_probs
 
 """ 
@@ -778,7 +856,8 @@ Returns:
 """
 def alignment_matrix(library, duplex):
     similar = np.zeros((len(library),len(library)))
-    for i in tqdm(range(len(similar))):
+    #for i in tqdm(range(len(similar))):
+    for i in range(len(similar)):
         for j in range(i,len(similar)):
             if not duplex:
                 val = edit_distance(library[i], library[j])
@@ -1041,6 +1120,7 @@ def row_tm_worker(args):
 
 """ 
 Generates a matrix of melting temperatures between all pairs of sequences in a library.
+Uses multiprocessing. 
 
 Because we can only do discrete temperatures/searches, we only evaluate temperatures
 within the range between low and high with a given step interval grain. 
@@ -1067,6 +1147,33 @@ def tm_mp(library, low, high, grain, conc, ncores):
         for i, row_slice in tqdm(pool.imap(row_tm_worker, tasks), total=size):
             tm_mat[i, i:] = row_slice
             tm_mat[i+1:, i] = row_slice[1:]  # mirror lower triangle
+
+    return tm_mat
+
+""" 
+Generates a matrix of melting temperatures between all pairs of sequences in a library.
+Does not use multiprocessing. 
+
+Because we can only do discrete temperatures/searches, we only evaluate temperatures
+within the range between low and high with a given step interval grain. 
+
+Args:   
+    library: list of seqs
+    low: lower bound of temperature range to investigate
+    high: upper bound of temperature range 
+    grain: temperature grain
+    conc: molar concentration of strands
+
+Returns:
+    tm_mat: matrix of melting temperatures
+"""
+def tm_no_mp(library, low, high, grain, conc):
+    size = len(library)
+    tm_mat = np.zeros((size, size))
+    for i in range(size):
+        i, row_slice = row_tm_worker((i, library, low, high, grain, conc))
+        tm_mat[i, i:] = row_slice
+        tm_mat[i+1:, i] = row_slice[1:]  # mirror lower triangle
 
     return tm_mat
 
