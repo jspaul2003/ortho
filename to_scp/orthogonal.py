@@ -646,10 +646,10 @@ def nupack_matrix_mp(library, model, conc, ncores, duplex):
     on_probs = np.zeros(size)
 
     with Pool(ncores) as pool:
-        for i, row_slice, on_p in tqdm(pool.imap(row_worker, tasks), total=size):
+        for i, row_slice, on_t in tqdm(pool.imap(row_worker, tasks), total=size):
             np_probs[i, i:] = row_slice
             np_probs[i+1:, i] = row_slice[1:]  # fill lower triangle by symmetry
-            on_probs[i] = on_p
+            on_probs[i] = on_t
 
     return np_probs, on_probs
 
