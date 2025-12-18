@@ -9,4 +9,4 @@ This repository consists of 4 main files.
 
 The attached pdf ortho.pdf describes the methods used in generating a duplex library. 
 
-There may well be bugs! Please email me at jspaul@caltech.edu to report any bugs (or if you have any suggestions :) )!
+There may well be bugs! Please email me at jspaul@stanford.edu to report any bugs (or if you have any suggestions :) )!

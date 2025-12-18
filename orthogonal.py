@@ -3,6 +3,380 @@ import numpy as np
 from tqdm import tqdm
 import nupack as nu
 
+""" 
+Returns a dot parens string representation of a duplex structure. 
+
+Args:
+    n: length of the duplex structure
+
+Returns:
+    str: dot parens string representation of the duplex structure
+"""
+def duplex_structure(n):
+    return "("*n + "+" + ")"*n
+
+""" 
+Returns a dot parens string representation of a single stranded structure. 
+
+Args:
+    n: length of the structure's underlying DNA sequence
+
+Returns:
+    str: dot parens string representation of the single stranded structure
+"""
+def ss_structure(n):
+    return "."*n
+
+"""  
+Compute ensemble defect of a structure between two sequences. 
+
+Args:
+    seq1: DNA sequence string
+    seq2: DNA sequence string
+    model: nupack model
+    structure: dot parens string representation of the structure
+
+Returns:
+    float: Ensemble defect of the structure between the two sequences
+"""
+def ensemble_defect_pair(seq1, seq2, model, structure):
+    P = nu.pairs(strands=[seq1, seq2], model=model).to_array()
+    S = nu.Structure(structure).matrix()
+    n = len(seq1) * 2
+    return  (n - (P*S).sum())/n
+
+""" 
+Compute ensemble defect of a structure for a single sequence. 
+
+Args:
+    seq1: DNA sequence string
+    model: nupack model
+    structure: dot parens string representation of the structure
+
+Returns:
+    float: Ensemble defect of the structure for the sequence
+"""
+def ensemble_defect_sole(seq1, model, structure):
+    P = nu.pairs(strands=[seq1], model=model).to_array()
+    S = nu.Structure(structure).matrix()
+    n = len(seq1) 
+    return  (n - (P*S).sum())/n
+
+"""
+Compute ensemble defects for on target structures.  
+
+For a duplex design, it will compute the ensemble defect for A+~A (duplex), A (single 
+stranded), and ~A (single stranded). 
+
+For a single stranded design, it will compute the ensemble defect for A (single stranded). 
+
+Args:
+    seq1: DNA sequence string
+    model: nupack model
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+
+Returns:
+    [float]: List of ensemble defects for the on target structures. 
+"""
+def np_ontarget_ensemble(seq1, model, duplex):
+    if duplex:
+        return [ensemble_defect_pair(seq1, nu.reverse_complement(seq1), model, 
+                                     duplex_structure(len(seq1))), 
+                ensemble_defect_sole(seq1, model, ss_structure(len(seq1))), 
+                ensemble_defect_sole(nu.reverse_complement(seq1), model, 
+                                     ss_structure(len(seq1)))]
+    else:
+        return [ensemble_defect_sole(seq1, model, ss_structure(len(seq1)))]
+
+"""
+Compute ensemble defects for off target structures. 
+
+For a duplex design, it will compute the ensemble defect for A+B (duplex), A+~B (duplex), 
+~A+B (duplex), and ~A+~B (duplex). 
+
+For a single stranded design, it will compute the ensemble defect for A+B (duplex). 
+
+Args:
+    seq1: DNA sequence string
+    seq2: DNA sequence string
+    model: nupack model
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+
+Returns:
+    [float]: List of off-target concentrations.
+"""
+def np_cross_ensemble(seq1, seq2, model, duplex):
+    if duplex:
+        o1 = ensemble_defect_pair(seq1, seq2, model, duplex_structure(len(seq1)))
+        o2 = ensemble_defect_pair(seq1, nu.reverse_complement(seq2), model, 
+                                  duplex_structure(len(seq1)))
+        o3 = ensemble_defect_pair(nu.reverse_complement(seq1), seq2, model, 
+                                  duplex_structure(len(seq1)))
+        o4 = ensemble_defect_pair(nu.reverse_complement(seq1), nu.reverse_complement(seq2), 
+                                  model, duplex_structure(len(seq1)))
+        return [o1, o2, o3, o4]
+    else:
+        return [ensemble_defect_pair(seq1, seq2, model, duplex_structure(len(seq1)))]
+    
+"""
+Compute expected off-target concentration for a given sequence on its own via NUPACK 
+analysis, when considering all max size = 2 possible structures
+
+For a duplex design, it will compute the ensemble defect for A+A (duplex) and ~A+~A 
+(duplex). 
+
+For a single stranded design, it will compute the ensemble defect for A+A (duplex). 
+
+Args:
+    seq1: DNA sequence string
+    model: nupack model
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+
+Returns:
+    [float]: List of off-target concentrations.
+"""
+def np_diag_ensemble(seq1, model, duplex):
+    if duplex:
+        o1 = ensemble_defect_pair(seq1, seq1, model, duplex_structure(len(seq1)))
+        o2 = ensemble_defect_pair(nu.reverse_complement(seq1), nu.reverse_complement(seq1), 
+                                  model, duplex_structure(len(seq1)))
+        return [o1, o2]
+    else:
+        o1 = ensemble_defect_pair(seq1, seq1, model, duplex_structure(len(seq1)))
+        return [o1]
+
+""" 
+Helper function for ensemble_matrix_mp and ensemble_matrix_no_mp.
+
+Computes a row of the off-target ensemble matrix for a given sequence. 
+The off-target ensemble matrix is a matrix where each row/column index represents a 
+sequence in the library. Each entry in the off-target ensemble matrix represents the 
+minimum ensemble defect of some off target complex between the sequence at the row index 
+and the sequence at the column index. Only diagonal entries consider self off-targets 
+for instance the complex ~A:~A. 
+
+Also computes the maximum on-target ensemble defect between the sequence at index i with 
+its reverse complement, and i and its reverse complement alone. 
+
+Args:
+    library: list of seqs
+    model: nupack model
+    conc: initial molar concentrations of strands 
+    i: index of the sequence to compute the row for
+    duplex: Whether we are designing a duplex (1) or single stranded library (0)
+    
+Returns:
+    i: index of the sequence to compute the row for
+    row[i:]: upper triangle of the np_probs row
+    on_p: on-target binding probability of the sequence at index i
+"""
+def ensemble_row_worker(args):
+    library, model, i, duplex = args
+    size = len(library)
+    row = np.zeros(size)
+    on_p = np.max(np_ontarget_ensemble(library[i], model, duplex))
+    
+    for j in range(i, size):
+        if i != j:
+            res = np_cross_ensemble(library[i], library[j], model, duplex)
+            p = np.min(res)
+        else:
+            res = np_diag_ensemble(library[i], model, duplex)
+            p = np.min(res)
+        
+        row[j] = p  # only upper triangle [i, j]
+
+    return i, row[i:], on_p  # return upper triangle 
+
+"""
+Generates the off-target probability matrix and the on-target binding probability array.
+Uses multiprocessing. 
+
+For the off-target matrix: 
+    each entry [i,j] represents the maximum probability of a given off-target complex
+    possible when seq i is exposed to j. (Self off-targets are only considered in the 
+    diagonal entries.)
+    
+For the on-target binding probability array:
+    each entry [i] represents the probability of on-target binding of seq i with its 
+    reverse complement.
+
+Args:
+    library: list of seqs
+    model: nupack conditions
+    conc: molar concentrations of strands
+    ncores: number of cores to use for parallel processing
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+
+Returns:
+    np_probs: NxN numpy array off-target probability matrix (N is the size of the library)
+    on_probs: length N numpy array on-target binding probability array
+"""
+def ensemble_matrix_mp(library, model, ncores, duplex):
+    size = len(library)
+    tasks = [(library, model, i, duplex) for i in range(size)]
+
+    print("Generating...\n")    # generates upper triangle
+    off_target_ensemble = np.zeros((size, size))
+    on_target_ensemble = np.zeros(size)
+
+    with Pool(ncores) as pool:
+        for i, row_slice, on_t in tqdm(pool.imap(ensemble_row_worker, tasks), total=size):
+            off_target_ensemble[i, i:] = row_slice
+            off_target_ensemble[i+1:, i] = row_slice[1:]  #fill lower triangle by symmetry
+            on_target_ensemble[i] = on_t
+
+    return off_target_ensemble, on_target_ensemble
+
+"""
+Generates the off-target probability matrix and the on-target binding probability array.
+Does not use multiprocessing. 
+
+For the off-target matrix: 
+    each entry [i,j] represents the maximum probability of a given off-target complex
+    possible when seq i is exposed to j. (Self off-targets are only considered in the 
+    diagonal entries.)
+    
+For the on-target binding probability array:
+    each entry [i] represents the probability of on-target binding of seq i with its 
+    reverse complement.
+
+Args:
+    library: list of seqs
+    model: nupack conditions
+    conc: molar concentrations of strands
+    ncores: number of cores to use for parallel processing
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+
+Returns:
+    np_probs: NxN numpy array off-target probability matrix (N is the size of the library)
+    on_probs: length N numpy array on-target binding probability array
+"""
+def ensemble_matrix_no_mp(library, model, duplex):
+    size = len(library)
+    off_target_ensemble = np.zeros((size, size))
+    on_target_ensemble = np.zeros(size)
+
+    for i in range(size):
+        i, row_slice, on_t = ensemble_row_worker((library, model, i, duplex))
+        off_target_ensemble[i, i:] = row_slice
+        off_target_ensemble[i+1:, i] = row_slice[1:]  #fill lower triangle by symmetry
+        on_target_ensemble[i] = on_t
+
+    return off_target_ensemble, on_target_ensemble
+
+""" 
+Off-target complex ensemble defect optimization. Removes sequences from library and 
+ensemble matrices that have too low an off-target complex ensemble defect, below a 
+specified threshold.
+
+At a high level, we find pairs of sequences that have low off-target ensemble defects 
+and remove the one with the lower total off-target score. (If equal, remove
+at random). We repeat this process until no pairs of sequences have lower than threshold 
+off-target ensemble defects. 
+
+Args:
+    off_target_ensemble: off-target ensemble matrix
+    library: list of seqs
+    threshold: threshold for off-target ensemble defect
+    reporting: Bool, True for verbose output
+    on_target_ensemble: on-target ensemble matrix
+
+Returns:
+    library: optimized list of seqs
+    final_off_target_ensemble: optimized off-target ensemble matrix
+    final_on_target_ensemble: optimized on-target ensemble matrix
+"""
+def ensemble_off_target_optimization(off_target_ensemble, library, threshold, reporting, on_target_ensemble):
+    assert(off_target_ensemble.shape[0] == off_target_ensemble.shape[1])
+    assert(off_target_ensemble.shape[0] == len(library))
+    n = off_target_ensemble.shape[0]
+    active = np.ones(n, dtype=bool)  # Tracks which sequences are still active
+    working_matrix = np.copy(off_target_ensemble)
+    
+    # first filter based off diagonal of matrix
+    for i in range(n):
+        active[i] = (working_matrix[i,i] >= threshold)
+        if reporting and not active[i]:
+            print("Too small self on-target complex ensemble defect detected")
+            print(f"seq {i}: " + library[i] + f", defect = {working_matrix[i,i]}")
+    
+    # filter based pair off-target ensemble defects
+    while True:
+        # mask inactive rows/columns
+        working_matrix[~active, :] = np.inf
+        working_matrix[:, ~active] = np.inf
+
+        min_i, min_j = np.unravel_index(np.argmin(working_matrix), off_target_ensemble.shape)
+        min_value = working_matrix[min_i, min_j]
+        
+        if min_value >= float(threshold):
+            break # loop until no more values above threshold
+
+        if reporting:
+            print("Too small an off-target complex ensemble defect detected")
+            print(f"seq {min_i}, seq {min_j}, defect = {min_value}")
+            print(f"seq {min_i}: " + library[min_i])
+            print(f"seq {min_j}: " + library[min_j])
+
+        # decide which sequence to remove based on total off-target score
+        score_i = np.sum(working_matrix[min_i, :])
+        score_j = np.sum(working_matrix[min_j, :])
+        # note that they share an entry so no need to subtract that
+        
+        if score_i < score_j:
+            remove_idx = min_i
+        elif score_i > score_j:
+            remove_idx = min_j
+        else:
+            remove_idx = np.random.choice([min_i, min_j])
+            
+        active[remove_idx] = False
+
+        if reporting:
+            print(f"Removed seq {remove_idx}, Remaining Elements {np.sum(active)}")
+
+    # final filtering
+    final_library = [seq for i, seq in enumerate(library) if active[i]]
+    final_off_target_ensemble = off_target_ensemble[np.ix_(active, active)]
+    final_on_target_ensemble = on_target_ensemble[active]
+
+    return final_library, final_off_target_ensemble, final_on_target_ensemble
+
+""" 
+On-target complex ensemble defect optimization. Removes sequences from library and 
+ensemble matrices that have too high an on-target complex ensemble defect, above a 
+specified threshold. 
+
+Args:
+    on_target_ensemble: on-target ensemble matrix
+    library: list of seqs
+    threshold: threshold for on-target ensemble defect
+    reporting: Bool, True for verbose output
+    off_target_ensemble: off-target ensemble matrix
+
+Returns:
+    library: optimized list of seqs
+    final_on_target_ensemble: optimized on-target ensemble matrix
+    final_off_target_ensemble: optimized off-target ensemble matrix
+"""
+def ensemble_on_target_optimization(on_target_ensemble, library, threshold_ON, reporting, off_target_ensemble):
+    assert(len(on_target_ensemble) == len(library))
+    n = len(on_target_ensemble)
+    active = np.ones(n, dtype=bool)  # Tracks which sequences are still active
+    for i in range(n):
+        active[i] = (on_target_ensemble[i] <= threshold_ON)
+        if reporting and not active[i]:
+            print(f"seq {i} has too high an on-target complex ensemble defect")
+            print(f"seq {i}: " + library[i] + f"    defect = {on_target_ensemble[i]}")
+
+    # final filtering
+    final_library = [seq for i, seq in enumerate(library) if active[i]]
+    final_on_target_ensemble = on_target_ensemble[active]
+    final_off_target_ensemble = off_target_ensemble[np.ix_(active, active)]
+
+    return final_library, final_on_target_ensemble, final_off_target_ensemble
+
 """
 Compute expected on-target concentration for a given sequence via NUPACK analysis, when 
 considering all max size = 2 possible structures. 
@@ -195,7 +569,7 @@ def np_crosstalk_tm(seq1, seq2, t, conc=1e-8):
         return [0.0]  # Returning zero as a fallback value
 
 """ 
-Helper function for nupack_matrix_mp.
+Helper function for nupack_matrix_mp and nupack_matrix_no_mp.
  
 Computes a row of the np_probs matrix for a given sequence. np_probs is a matrix where 
 each row/column index represents a sequence in the library. Each entry in np_probs 
@@ -241,6 +615,8 @@ def row_worker(args):
 
 """
 Generates the off-target probability matrix and the on-target binding probability array. 
+Uses multiprocessing. 
+
 For the off-target matrix: 
     each entry [i,j] represents the maximum probability of a given off-target complex
     possible when seq i is exposed to j. (Self off-targets are only considered in the 
@@ -275,6 +651,41 @@ def nupack_matrix_mp(library, model, conc, ncores, duplex):
             np_probs[i+1:, i] = row_slice[1:]  # fill lower triangle by symmetry
             on_probs[i] = on_t
 
+    return np_probs, on_probs
+
+"""
+Generates the off-target probability matrix and the on-target binding probability array. 
+Does not use multiprocessing. 
+
+For the off-target matrix: 
+    each entry [i,j] represents the maximum probability of a given off-target complex
+    possible when seq i is exposed to j. (Self off-targets are only considered in the 
+    diagonal entries.)
+    
+For the on-target binding probability array:
+    each entry [i] represents the probability of on-target binding of seq i with its 
+    reverse complement.
+
+Args:
+    library: list of seqs
+    model: nupack conditions
+    conc: molar concentrations of strands
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+
+Returns:
+    np_probs: NxN numpy array off-target probability matrix (N is the size of the library)
+    on_probs: length N numpy array on-target binding probability array
+"""
+def nupack_matrix_no_mp(library, model, conc, duplex):
+    size = len(library)
+    np_probs = np.zeros((size, size))
+    on_probs = np.zeros(size)
+
+    for i in range(size):
+        i, row_slice, on_t = row_worker((library, model, conc, i, duplex))
+        np_probs[i, i:] = row_slice
+        np_probs[i+1:, i] = row_slice[1:]  # fill lower triangle by symmetry
+        on_probs[i] = on_t
     return np_probs, on_probs
 
 """ 
@@ -385,6 +796,148 @@ def sim_optimization(library, threshold_SIM, reporting, duplex):
     final_library = [seq for idx, seq in enumerate(library) if active[idx]]
     return final_library
 
+"""
+returns 1 if a and b are different, 0 if they are the same
+
+args:
+    a: character
+    b: character
+
+returns:
+    int: 1 if a and b are different, 0 if they are the same
+"""
+def diff(a,b):
+    if a == b:
+        return 0
+    else:
+        return 1
+
+""" 
+returns the edit distance between two sequences. Edit distance represents an alignment 
+between two sequences where gaps are allowed. 
+
+args:
+    seq1: sequence 1
+    seq2: sequence 2
+
+returns:
+    int: edit distance between seq1 and seq2
+"""
+def edit_distance(seq1, seq2):
+    E = np.zeros((len(seq1) + 1, len(seq2) + 1))
+    for i in range(len(seq1) + 1):
+        E[i, 0] = i
+    for j in range(len(seq2) + 1):
+        E[0, j] = j
+    for i in range(1, len(seq1) + 1):
+        for j in range(1, len(seq2) + 1):
+            E[i,j] = min(E[i-1,j] + 1, E[i,j-1] + 1, E[i-1,j-1] + diff(seq1[i-1], seq2[j-1]))
+    return E[len(seq1), len(seq2)]
+
+""" 
+Generates a character alignment matrix. 
+
+If designing for a duplex library, each entry [i,j] is the minimum among the edit 
+distances:
+1. between seq i and seq j 
+2. between seq i and the reverse complement of seq j
+3. between the reverse complement of seq i and seq j
+4. between the reverse complement of seq i and the reverse complement of seq j
+
+If designing for a single stranded library, each entry [i,j] is the edit distance between 
+seq i and seq j. 
+
+Args:
+    library: list of seqs
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+    
+Returns:
+    similar: NxN numpy array of edit distances
+"""
+def alignment_matrix(library, duplex):
+    similar = np.zeros((len(library),len(library)))
+    #for i in tqdm(range(len(similar))):
+    for i in range(len(similar)):
+        for j in range(i,len(similar)):
+            if not duplex:
+                val = edit_distance(library[i], library[j])
+            else: 
+                # get highest similarity with all 4 possible combinations of seqs i and j
+                # by considering their reverse complements also
+                vals = []
+                vals.append(edit_distance(library[i], library[j]))
+                vals.append(edit_distance(library[i], nu.reverse_complement(library[j])))
+                val = np.min(vals)
+            similar[i][j] = val
+            similar[j][i] = val
+    
+    return similar
+
+""" 
+Alignment optimization. Removes sequences from library and probability matrix that 
+are too similar: ie when they are below a specified edit distance threshold, 
+threshold_ALIGN.
+
+At a high level, we find pairs of sequences that are too similar and remove the one with 
+the highest similarity with some other sequence. (If equal, remove at random). We repeat 
+this process until no pairs of sequences are too similar above the threshold. 
+
+Args:
+    library: list of seqs
+    threshold_ALIGN: threshold for alignment
+    reporting: Bool, True if you want to print out the process
+    duplex: Whether we are designing for a duplex (1) or single stranded library (0)
+
+Returns:
+    library: optimized list of seqs
+"""
+def align_optimization(library, threshold_EDIT, reporting, duplex):
+    working_matrix = alignment_matrix(library, duplex)
+    n = working_matrix.shape[0]
+    
+    # make the diagonal infinity to ignore self-alignment
+    np.fill_diagonal(working_matrix, np.inf)
+
+    active = np.ones(n, dtype=bool)  # Keep track of active (non-removed) sequences
+    
+    while True:
+        # Mask inactive rows/cols as infinity and ignore
+        working_matrix[~active, :] = np.inf
+        working_matrix[:, ~active] = np.inf
+        
+        min_val = np.min(working_matrix)
+        if min_val >= threshold_EDIT:
+            break   # loop until edit distance criterion satisfied
+
+        i, j = np.unravel_index(np.argmin(working_matrix), working_matrix.shape)
+        
+        if reporting:
+            print(f"{library[i]} and {library[j]} are too similar")
+            print(f"Edit distance: {working_matrix[i][j]}")
+
+        # Evaluate which to remove based on max edit distance to others
+        a = np.copy(working_matrix[i])
+        b = np.copy(working_matrix[j])
+        a[j] = 0    # ignoring each other...
+        b[i] = 0
+
+        if np.min(a) < np.min(b):
+            to_remove = i
+        elif np.min(a) > np.min(b):
+            to_remove = j
+        else:
+            to_remove = np.random.choice([i, j])  # Randomly choose if equal
+
+        active[to_remove] = False
+
+        if reporting:
+            print(f"Removing {library[to_remove]}")
+            print(f"Remaining Elements {np.sum(active)}")
+
+    # Rebuild final filtered library
+    final_library = [seq for idx, seq in enumerate(library) if active[idx]]
+    return final_library
+
 """ 
 Off-target optimization. Removes sequences from library and probability matrix that
 have high off-target binding probabilities, above a specified threshold.
@@ -420,7 +973,6 @@ def off_target_optimization(nu_mat, library, threshold, reporting, on_t):
             print("Excess self off-target binding detected")
             print(f"seq {i}: " + library[i] + f", p = {working_matrix[i,i]}")
         
-
     while True:
         # mask inactive rows/columns
         working_matrix[~active, :] = 0
@@ -565,6 +1117,7 @@ def row_tm_worker(args):
 
 """ 
 Generates a matrix of melting temperatures between all pairs of sequences in a library.
+Uses multiprocessing. 
 
 Because we can only do discrete temperatures/searches, we only evaluate temperatures
 within the range between low and high with a given step interval grain. 
@@ -591,6 +1144,33 @@ def tm_mp(library, low, high, grain, conc, ncores):
         for i, row_slice in tqdm(pool.imap(row_tm_worker, tasks), total=size):
             tm_mat[i, i:] = row_slice
             tm_mat[i+1:, i] = row_slice[1:]  # mirror lower triangle
+
+    return tm_mat
+
+""" 
+Generates a matrix of melting temperatures between all pairs of sequences in a library.
+Does not use multiprocessing. 
+
+Because we can only do discrete temperatures/searches, we only evaluate temperatures
+within the range between low and high with a given step interval grain. 
+
+Args:   
+    library: list of seqs
+    low: lower bound of temperature range to investigate
+    high: upper bound of temperature range 
+    grain: temperature grain
+    conc: molar concentration of strands
+
+Returns:
+    tm_mat: matrix of melting temperatures
+"""
+def tm_no_mp(library, low, high, grain, conc):
+    size = len(library)
+    tm_mat = np.zeros((size, size))
+    for i in range(size):
+        i, row_slice = row_tm_worker((i, library, low, high, grain, conc))
+        tm_mat[i, i:] = row_slice
+        tm_mat[i+1:, i] = row_slice[1:]  # mirror lower triangle
 
     return tm_mat
 
