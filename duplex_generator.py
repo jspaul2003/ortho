@@ -23,7 +23,7 @@ conc = 1e-6
 l = 16
 
 #<MODIFIABLE> SSM K parameter 
-k = 6
+k = 8
 
 #<MODIFIABLE> character similarity threshold
 threshold_SIM = 12 
@@ -31,8 +31,14 @@ threshold_SIM = 12
 #<MODIFIABLE> Standard operating temperature of DNA reaction in celsius
 rxn_temp = 37 
 
-#<MODIFIABLE> Nupack model, can change salt conditions here
-my_model = nu.Model(material='dna', celsius=rxn_temp) 
+#<MODIFIABLE> NUPACK physical model used by concentration and Tm stages
+model_config = {
+    "material": "dna",
+    "ensemble": "stacking",
+    "sodium": 1.0,
+    "magnesium": 0.0,
+}
+my_model = nu.Model(celsius=rxn_temp, **model_config)
 
 #<MODIFIABLE> On-target probability threshold
 threshold_ON = 0.9
@@ -88,16 +94,32 @@ if __name__ == "__main__":
         library_with_complements.append(seq)
         library_with_complements.append(nu.reverse_complement(seq))
     # Make the melting temperature matrix
-    tm_mat = tm_mp(library_with_complements, low, high, grain, conc, ncores)
-    np.save("_tmmat.npy", tm_mat) #to_remove in final
-    save_lib(library, "intermediate.csv") #to_remove in final
+    tm_mat, tm_status = tm_mp(
+        library_with_complements,
+        low,
+        high,
+        grain,
+        conc,
+        ncores,
+        model_config,
+    )
+    np.savez_compressed(
+        "tm_results.npz", temperatures=tm_mat, status=tm_status
+    )
     
     print("STEP 7/9: Melting Temperature Filtering\n")
-    library = tm_optimization(library, tm_mat, delta, reporting)
+    tm_input_library = list(library)
+    library = tm_optimization(library, tm_mat, delta, reporting, tm_status)
     print_library_size(library)
 
     print("STEP 8/9: Melting Temperature Range Optimization\n")
-    library, best_range = tm_bounds_optimization(library, tm_mat, my_range, reporting)
+    retained = [tm_input_library.index(sequence) for sequence in library]
+    strand_indices = [index for i in retained for index in (2 * i, 2 * i + 1)]
+    filtered_tm_mat = tm_mat[np.ix_(strand_indices, strand_indices)]
+    filtered_tm_status = tm_status[np.ix_(strand_indices, strand_indices)]
+    library, best_range = tm_bounds_optimization(
+        library, filtered_tm_mat, my_range, reporting, filtered_tm_status
+    )
     print_library_size(library)
 
     print("STEP 9/9: Saving Library\n")

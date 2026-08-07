@@ -3,6 +3,18 @@ import numpy as np
 from tqdm import tqdm
 import nupack as nu
 
+
+TM_STATUS_BELOW = -1
+TM_STATUS_BRACKETED = 0
+TM_STATUS_ABOVE = 1
+
+DEFAULT_TM_MODEL_CONFIG = {
+    "material": "dna",
+    "ensemble": "stacking",
+    "sodium": 1.0,
+    "magnesium": 0.0,
+}
+
 """ 
 Returns a dot parens string representation of a duplex structure. 
 
@@ -533,40 +545,75 @@ def np_crosstalk_diag(seq1, model, conc, duplex):
         return [o1_conc] 
     
 """
-Given sequences seq1 and seq2, compute the final expected concentration of 
-1. [seq1:seq2]
-2. [seq1] 
-3. [seq2]
-given the nupack model and initial [seq1] = conc, [seq2] = conc. When doing this, we 
-ignore seq1:seq1 and seq2:seq2 as possible structures. This is used for the 
-melting temperature calculation. 
+Compute normalized target-duplex occupancy for a melting-temperature search.
+Distinct sequences are supplied as separate species at concentration conc and their
+homodimers are excluded. Identical sequences are modeled as a true homodimer with one
+species supplied at total concentration 2*conc.
 
 Args:
     seq1: DNA sequence string
     seq2: DNA sequence string
-    model: nupack model
+    t: temperature in degrees Celsius
     conc: Concentration of strands in molar
+    model_config: complete NUPACK model configuration apart from temperature
 
 Returns:
-    [float]: List of concentrations of [seq1:seq2], [seq1], and [seq2].
+    float: target-complex concentration divided by conc
 """
-def np_crosstalk_tm(seq1, seq2, t, conc=1e-8):
-    model = nu.Model(material='dna', celsius=t) # you may want to modify this for your purposes
-    A = nu.Strand(seq1, name='A')
-    B = nu.Strand(seq2, name='B')
-    c1 = nu.Complex([A, B], name="c1")
-    c1_ignore = nu.Complex([A, A], name="c1_ignore")
-    c2_ignore = nu.Complex([B, B], name="c2_ignore")
-    my_tube = nu.Tube(strands={A: conc, B: conc}, 
-                      name='my_tube', complexes=nu.SetSpec(max_size=2, 
-                      exclude = [c1_ignore, c2_ignore], 
-                      include = [c1]))
-    try:
-        tube_results = nu.tube_analysis(tubes=[my_tube], model=model)
-        return [tube_results.tubes[my_tube].complex_concentrations[c] for c in [c1]]
-    except Exception as e:
-        print(f"Error in np_crosstalk_tm for {seq1} and {seq2} at {t}°C: {e}")
-        return [0.0]  # Returning zero as a fallback value
+def _temperature_model(model_config, temperature):
+    """Construct a temperature-specific NUPACK model without dropping settings."""
+    config = dict(DEFAULT_TM_MODEL_CONFIG if model_config is None else model_config)
+    required = {"material", "ensemble", "sodium", "magnesium"}
+    missing = required.difference(config)
+    if missing:
+        raise ValueError(
+            "Tm model configuration is missing required option(s): "
+            + ", ".join(sorted(missing))
+        )
+    config.pop("celsius", None)
+    config.pop("kelvin", None)
+    config["celsius"] = float(temperature)
+    return nu.Model(**config)
+
+
+def np_crosstalk_tm(seq1, seq2, t, conc=1e-8, model_config=None):
+    """Return the normalized equilibrium occupancy of ``seq1:seq2`` at ``t``.
+
+    Distinct sequences are represented as two strand species, each supplied at
+    ``conc``. Identical sequences are represented as one species supplied at
+    ``2 * conc`` so that diagonal entries are true homodimer calculations. Any
+    NUPACK error propagates to the caller; a failed calculation is never scored
+    as weak binding.
+    """
+    if conc <= 0:
+        raise ValueError("conc must be positive")
+
+    model = _temperature_model(model_config, t)
+    A = nu.Strand(seq1, name="A")
+
+    if seq1 == seq2:
+        target = nu.Complex([A, A], name="target")
+        tube = nu.Tube(
+            strands={A: 2 * conc},
+            name="tm_tube",
+            complexes=nu.SetSpec(max_size=2, include=[target]),
+        )
+    else:
+        B = nu.Strand(seq2, name="B")
+        target = nu.Complex([A, B], name="target")
+        aa = nu.Complex([A, A], name="exclude_AA")
+        bb = nu.Complex([B, B], name="exclude_BB")
+        tube = nu.Tube(
+            strands={A: conc, B: conc},
+            name="tm_tube",
+            complexes=nu.SetSpec(
+                max_size=2, exclude=[aa, bb], include=[target]
+            ),
+        )
+
+    result = nu.tube_analysis(tubes=[tube], model=model)
+    target_concentration = result.tubes[tube].complex_concentrations[target]
+    return float(target_concentration / conc)
 
 """ 
 Helper function for nupack_matrix_mp and nupack_matrix_no_mp.
@@ -1055,9 +1102,8 @@ For a given row index i in a library, this function computes the melting tempera
 for the complex formed by the sequences at index i and all subsequent indices in
 the library (building a row in the upper triangle of a melting array matrix). 
 
-This is done by performing a binary search over a range of temperatures
-to find the temperature at which the probability of formation of the complex
-is 0.5. 
+This is done by evaluating the grid endpoints, explicitly classifying out-of-range
+values, and performing a binary search only when 0.5 occupancy is bracketed.
 
 Because we can only do discrete temperatures/searches, we use a binary search across 
 an array of temperatures represented by the range between low and high with a given step 
@@ -1070,50 +1116,86 @@ Args:
     high: upper bound of temperature range 
     grain: temperature grain
     conc: molar concentration of strands
+    model_config: complete NUPACK model configuration apart from temperature
     
 Returns:
     i: index i
     row[i:]: upper triangle slice of the melting array matrix
+    status_row[i:]: below-range (-1), bracketed (0), or above-range (1)
 """
+def _tm_grid(low, high, grain):
+    if grain <= 0:
+        raise ValueError("grain must be positive")
+    temperatures = np.arange(low, high, grain, dtype=float)
+    if temperatures.size == 0:
+        raise ValueError("Tm search grid is empty")
+    return temperatures
+
+
+def tm_grid_search(temperatures, occupancy_function):
+    """Find the sampled temperature nearest 50% occupancy on a monotone grid."""
+    temperatures = np.asarray(temperatures, dtype=float)
+    if temperatures.ndim != 1 or temperatures.size == 0:
+        raise ValueError("temperatures must be a non-empty one-dimensional array")
+
+    cache = {}
+
+    def occupancy(index):
+        if index not in cache:
+            value = float(occupancy_function(float(temperatures[index])))
+            if not np.isfinite(value):
+                raise ValueError(
+                    f"Non-finite Tm occupancy at {temperatures[index]} degrees C"
+                )
+            cache[index] = value
+        return cache[index]
+
+    low_occupancy = occupancy(0)
+    high_occupancy = occupancy(len(temperatures) - 1)
+    if low_occupancy < 0.5:
+        return temperatures[0], TM_STATUS_BELOW
+    if high_occupancy > 0.5:
+        return temperatures[-1], TM_STATUS_ABOVE
+
+    if low_occupancy == 0.5:
+        return temperatures[0], TM_STATUS_BRACKETED
+    if high_occupancy == 0.5:
+        return temperatures[-1], TM_STATUS_BRACKETED
+
+    left = 0
+    right = len(temperatures) - 1
+    while right - left > 1:
+        middle = left + (right - left) // 2
+        if occupancy(middle) >= 0.5:
+            left = middle
+        else:
+            right = middle
+
+    # Both neighboring grid points are evaluated before selecting the closest.
+    left_error = abs(occupancy(left) - 0.5)
+    right_error = abs(occupancy(right) - 0.5)
+    best = left if left_error <= right_error else right
+    return temperatures[best], TM_STATUS_BRACKETED
+
+
 def row_tm_worker(args):
-    i, library, low, high, grain, conc = args
+    i, library, low, high, grain, conc, model_config = args
     size = len(library)
-    temperatures = np.arange(low, high, grain)
+    temperatures = _tm_grid(low, high, grain)
     row = np.zeros(size)
+    status_row = np.zeros(size, dtype=np.int8)
 
     for j in range(i, size):
-        probs = [0] * len(temperatures)
-        low_index = 0
-        high_index = len(temperatures) - 1
-        middle_index = 0
-        top_index = 0
-        while low_index <= high_index:
-            middle_index = low_index + (high_index - low_index) // 2
-            t_mid = temperatures[middle_index]
-            if probs[middle_index] == 0:
-                prob_mid = np_crosstalk_tm(library[i], library[j], t_mid, conc)[0] / conc
-                probs[middle_index] = prob_mid
-            else:
-                prob_mid = probs[middle_index]
-            if prob_mid > 0.5:
-                low_index = middle_index + 1
-            elif prob_mid < 0.5:
-                high_index = middle_index - 1
-            else:
-                top_index = middle_index
-                break
-            if abs(prob_mid - 0.5) < abs(probs[top_index] - 0.5):
-                top_index = middle_index
+        value, status = tm_grid_search(
+            temperatures,
+            lambda temperature: np_crosstalk_tm(
+                library[i], library[j], temperature, conc, model_config
+            ),
+        )
+        row[j] = value
+        status_row[j] = status
 
-        if probs[top_index] > 0.001: # You may choose to neglect this if/else...
-            # has to be somewhat significant! if this low (<0.1%), then we haven't found a 
-            # valid melting temp!
-            val = temperatures[top_index]
-        else:
-            val = low
-        row[j] = val
-
-    return i, row[i:]  # return only upper triangle slice
+    return i, row[i:], status_row[i:]
 
 """ 
 Generates a matrix of melting temperatures between all pairs of sequences in a library.
@@ -1131,21 +1213,33 @@ Args:
     ncores: number of cores to use for parallel processing
 
 Returns:
-    tm_mat: matrix of melting temperatures
+    tm_mat: numerical matrix of melting temperatures or censoring endpoints
+    tm_status: matrix of below-range (-1), bracketed (0), or above-range (1) states
 """
-def tm_mp(library, low, high, grain, conc, ncores):
+def tm_mp(library, low, high, grain, conc, ncores, model_config=None):
     size = len(library)
-    tasks = [(i, library, low, high, grain, conc) for i in range(size)]
+    model_config = dict(
+        DEFAULT_TM_MODEL_CONFIG if model_config is None else model_config
+    )
+    _temperature_model(model_config, low)
+    tasks = [
+        (i, library, low, high, grain, conc, model_config) for i in range(size)
+    ]
 
     print("Generating Melting Temperature Matrix \n")
     tm_mat = np.zeros((size, size))
+    tm_status = np.zeros((size, size), dtype=np.int8)
 
     with Pool(ncores) as pool:
-        for i, row_slice in tqdm(pool.imap(row_tm_worker, tasks), total=size):
+        for i, row_slice, status_slice in tqdm(
+            pool.imap(row_tm_worker, tasks), total=size
+        ):
             tm_mat[i, i:] = row_slice
             tm_mat[i+1:, i] = row_slice[1:]  # mirror lower triangle
+            tm_status[i, i:] = status_slice
+            tm_status[i+1:, i] = status_slice[1:]
 
-    return tm_mat
+    return tm_mat, tm_status
 
 """ 
 Generates a matrix of melting temperatures between all pairs of sequences in a library.
@@ -1162,17 +1256,27 @@ Args:
     conc: molar concentration of strands
 
 Returns:
-    tm_mat: matrix of melting temperatures
+    tm_mat: numerical matrix of melting temperatures or censoring endpoints
+    tm_status: matrix of below-range (-1), bracketed (0), or above-range (1) states
 """
-def tm_no_mp(library, low, high, grain, conc):
+def tm_no_mp(library, low, high, grain, conc, model_config=None):
     size = len(library)
     tm_mat = np.zeros((size, size))
+    tm_status = np.zeros((size, size), dtype=np.int8)
+    model_config = dict(
+        DEFAULT_TM_MODEL_CONFIG if model_config is None else model_config
+    )
+    _temperature_model(model_config, low)
     for i in range(size):
-        i, row_slice = row_tm_worker((i, library, low, high, grain, conc))
+        i, row_slice, status_slice = row_tm_worker(
+            (i, library, low, high, grain, conc, model_config)
+        )
         tm_mat[i, i:] = row_slice
         tm_mat[i+1:, i] = row_slice[1:]  # mirror lower triangle
+        tm_status[i, i:] = status_slice
+        tm_status[i+1:, i] = status_slice[1:]
 
-    return tm_mat
+    return tm_mat, tm_status
 
 '''
 Helper function for tm_optimization. 
@@ -1229,9 +1333,8 @@ def tm_optimization_helper(tm_on, tm_off, delta):
     return active_1
 
 '''
-Melting temperature optimization. Removes sequences from library that have strong 
-off-target interactions with other sequences. ie such that all sequences returned 
-satisfy the condition max(tm_off) - min(tm_on) <= delta.
+Melting temperature optimization. Removes duplexes with strong off-target interactions
+so the returned library satisfies max(tm_off) <= min(tm_on) - delta.
 
 At a high level, we iteratively check if removing the worst on-target sequence improves 
 the number of sequences that satisfy the delta constraint, as compared to just removing 
@@ -1249,27 +1352,85 @@ args:
     delta: minimum accepted difference between on-target and off-target melting 
             temperatures in optimized library
     reporting: Bool, True for verbose output
+    tm_status: optional censoring-status matrix returned by tm_mp or tm_no_mp
 
 returns:
     new_library: list of seqs that satisfy the delta constraint
 '''
-def tm_optimization(library, tm_mat, delta, reporting):
-    # Extract on-target values and indices and save as an array
+def duplex_tm_summaries(tm_mat, tm_status=None):
+    """Collapse a strand-pair Tm matrix into duplex on/off-target summaries."""
+    tm_mat = np.asarray(tm_mat, dtype=float)
+    if tm_mat.ndim != 2 or tm_mat.shape[0] != tm_mat.shape[1]:
+        raise ValueError("tm_mat must be square")
+    if tm_mat.shape[0] % 2:
+        raise ValueError("tm_mat must contain two strand species per duplex")
+    if tm_status is None:
+        tm_status = np.full(tm_mat.shape, TM_STATUS_BRACKETED, dtype=np.int8)
+    else:
+        tm_status = np.asarray(tm_status, dtype=np.int8)
+        if tm_status.shape != tm_mat.shape:
+            raise ValueError("tm_status must have the same shape as tm_mat")
+
     on_indices = [(i, i+1) for i in range(0, len(tm_mat) - 1, 2)]
-    tm_on = [tm_mat[i, j] for i, j in on_indices]
-    
-    # create an off target tm_mat matrix which only includes the maximum melting 
-    # temperature of off targets between a strand & its complement number i and 
-    # a strand & its complement number j
-    tm_off = np.zeros((len(tm_mat)//2,len(tm_mat)//2))
+    tm_on = np.asarray([tm_mat[i, j] for i, j in on_indices], dtype=float)
+    on_status = np.asarray(
+        [tm_status[i, j] for i, j in on_indices], dtype=np.int8
+    )
+
+    duplex_count = len(tm_mat) // 2
+    tm_off = np.zeros((duplex_count, duplex_count), dtype=float)
+    off_status = np.zeros((duplex_count, duplex_count), dtype=np.int8)
+
+    def summarize(entries):
+        values = np.asarray([tm_mat[i, j] for i, j in entries], dtype=float)
+        statuses = np.asarray([tm_status[i, j] for i, j in entries], dtype=np.int8)
+        if np.any(statuses == TM_STATUS_ABOVE):
+            return float(np.max(values[statuses == TM_STATUS_ABOVE])), TM_STATUS_ABOVE
+        if np.any(statuses == TM_STATUS_BRACKETED):
+            bracketed = values[statuses == TM_STATUS_BRACKETED]
+            return float(np.max(bracketed)), TM_STATUS_BRACKETED
+        return float(np.max(values)), TM_STATUS_BELOW
+
     for i in range(len(tm_off)):
-        tm_off[i][i] = np.max([tm_mat[2*i][2*i],tm_mat[2*i+1][2*i+1]])
+        value, status = summarize([(2*i, 2*i), (2*i+1, 2*i+1)])
+        tm_off[i, i] = value
+        off_status[i, i] = status
         for j in range(i+1, len(tm_off)):
-            tm_off[i][j] = np.max([tm_mat[2*i][2*j],   tm_mat[2*i+1][2*j],
-                                  tm_mat[2*i][2*j+1], tm_mat[2*i+1][2*j+1]])
-            tm_off[j][i] = tm_off[i][j] # symmetry!
-    
-    assert(len(tm_off) == len(tm_on))
+            entries = [
+                (2*i, 2*j), (2*i+1, 2*j),
+                (2*i, 2*j+1), (2*i+1, 2*j+1),
+            ]
+            value, status = summarize(entries)
+            tm_off[i, j] = tm_off[j, i] = value
+            off_status[i, j] = off_status[j, i] = status
+
+    return tm_on, tm_off, on_status, off_status
+
+
+def effective_duplex_tm(tm_mat, tm_status=None):
+    """Return conservative numerical summaries suitable for Tm filtering."""
+    tm_on, tm_off, on_status, off_status = duplex_tm_summaries(
+        tm_mat, tm_status
+    )
+    effective_on = tm_on.copy()
+    effective_off = tm_off.copy()
+    effective_on[on_status == TM_STATUS_BELOW] = -np.inf
+    effective_off[off_status == TM_STATUS_ABOVE] = np.inf
+    return effective_on, effective_off, on_status, off_status
+
+
+def tm_optimization(library, tm_mat, delta, reporting, tm_status=None):
+    tm_on, tm_off, on_status, _ = effective_duplex_tm(tm_mat, tm_status)
+    if len(tm_on) != len(library):
+        raise ValueError("library and Tm matrix contain different duplex counts")
+
+    # A below-range on-target cannot establish the requested separation.
+    eligible = on_status != TM_STATUS_BELOW
+    eligible_indices = np.flatnonzero(eligible)
+    if eligible_indices.size == 0:
+        return []
+    tm_on = tm_on[eligible]
+    tm_off = tm_off[np.ix_(eligible, eligible)]
     
     active_1 = tm_optimization_helper(tm_on, tm_off, delta)
     working_tm_off = np.copy(tm_off)
@@ -1299,7 +1460,8 @@ def tm_optimization(library, tm_mat, delta, reporting):
     if reporting:
         print(f"Number of sequences satisfying delta constraint: {np.sum(active_1)}\n")
         
-    new_library = [seq for i, seq in enumerate(library) if active_1[i]]
+    selected_indices = eligible_indices[active_1]
+    new_library = [library[i] for i in selected_indices]
     return new_library
     
 '''
@@ -1318,12 +1480,14 @@ returns:
     best_library: list of seqs within the best range
     best_range: tuple of lower and upper melting temperature bounds
 '''
-def tm_bounds_optimization(library, tm_mat, my_range, reporting):
+def tm_bounds_optimization(library, tm_mat, my_range, reporting, tm_status=None):
     if my_range == 0:
         return library, (0, 0)
-    # extract on targets and sort
-    on_indices = [(i, i+1) for i in range(0, len(tm_mat) - 1, 2)]
-    tm_on = [tm_mat[i, j] for i, j in on_indices]
+    tm_on, _, on_status, _ = duplex_tm_summaries(tm_mat, tm_status)
+    eligible_indices = np.flatnonzero(on_status != TM_STATUS_BELOW)
+    tm_on = tm_on[eligible_indices]
+    if tm_on.size == 0:
+        return [], (0, 0)
     sorted_tm = sorted(tm_on)
     sorted_tm = list(dict.fromkeys(sorted_tm)) # remove duplicates
     
@@ -1336,8 +1500,10 @@ def tm_bounds_optimization(library, tm_mat, my_range, reporting):
         min_tm = sorted_tm[i] # possible lower bounds
         max_tm = min_tm + my_range
 
-        valid_indices = [on_indices[idx][0] // 2 for idx, tm in enumerate(tm_on) 
-                         if min_tm <= tm <= max_tm]
+        valid_indices = [
+            int(eligible_indices[idx]) for idx, tm in enumerate(tm_on)
+            if min_tm <= tm <= max_tm
+        ]
         count = len(valid_indices)
 
         if count > max_count:
