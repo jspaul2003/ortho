@@ -90,8 +90,15 @@ if __name__ == "__main__":
             # Standard desired operating temperature of DNA reaction. Used for probability matrix.
             rxn_temp = float(input("<Reaction Temperature (°C)> "))    
             
-            my_model = nu.Model(material='dna', celsius=rxn_temp) 
-            # ^^ MODIFY W/ FURTHER SALT SPECIFICATIONS IF DESIRED (see nupack documentation)
+            model_config = {
+                "material": "dna",
+                "ensemble": "stacking",
+                "sodium": 1.0,
+                "magnesium": 0.0,
+            }
+            my_model = nu.Model(celsius=rxn_temp, **model_config)
+            with open('_model_config.pkl', 'wb') as f:
+                pickle.dump(model_config, f)
             
             # Run SSM Hamiltonian Set generation via Seqwalk
             print("STEP 1/3: Generating SSM Hamiltonian Set\n")
@@ -180,26 +187,52 @@ if __name__ == "__main__":
                 library_with_complements.append(seq)
                 library_with_complements.append(nu.reverse_complement(seq))
             # Make the melting temperature matrix
-            tm_mat = tm_mp(library_with_complements, low, high, grain, conc, ncores)
-            print(tm_mat)
+            with open('_model_config.pkl', 'rb') as f:
+                model_config = pickle.load(f)
+            tm_mat, tm_status = tm_mp(
+                library_with_complements,
+                low,
+                high,
+                grain,
+                conc,
+                ncores,
+                model_config,
+            )
             # optimize
-            library = tm_optimization(library, tm_mat, delta, reporting)
+            tm_input_library = list(library)
+            library = tm_optimization(
+                library, tm_mat, delta, reporting, tm_status
+            )
+            retained = [tm_input_library.index(sequence) for sequence in library]
+            strand_indices = [
+                index for i in retained for index in (2 * i, 2 * i + 1)
+            ]
+            filtered_tm_mat = tm_mat[np.ix_(strand_indices, strand_indices)]
+            filtered_tm_status = tm_status[np.ix_(strand_indices, strand_indices)]
             
             with open('_tmfilterlibrary.pkl','wb') as f:
                 pickle.dump(library, f)
-            np.save("_tmmat.npy", tm_mat)
+            np.savez_compressed(
+                "_tm_results.npz",
+                temperatures=filtered_tm_mat,
+                status=filtered_tm_status,
+            )
             to_save = int(input(save_message)) 
             if to_save:
                 user_save(library, 0)
         
         elif command == "tmRange":
-            tm_mat = np.load("_tmmat.npy")
+            tm_results = np.load("_tm_results.npz")
+            tm_mat = tm_results["temperatures"]
+            tm_status = tm_results["status"]
             with open('_tmfilterlibrary.pkl','rb') as f:
                 library = pickle.load(f)
             
             my_range = float(input("<Melting Temperature Max Desired Range (°C)> "))
             
-            library, best_range = tm_bounds_optimization(library, tm_mat, my_range, reporting)
+            library, best_range = tm_bounds_optimization(
+                library, tm_mat, my_range, reporting, tm_status
+            )
             
             #program complete for duplex generation
             print("Duplex library generation complete. Please save.")
