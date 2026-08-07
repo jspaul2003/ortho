@@ -31,8 +31,14 @@ threshold_SIM = 12
 #<MODIFIABLE> Standard operating temperature of DNA reaction in celsius
 rxn_temp = 37 
 
-#<MODIFIABLE> Nupack model, can change salt conditions here
-my_model = nu.Model(material='dna', celsius=rxn_temp) 
+#<MODIFIABLE> NUPACK physical model
+model_config = {
+    "material": "dna",
+    "ensemble": "stacking",
+    "sodium": 1.0,
+    "magnesium": 0.0,
+}
+my_model = nu.Model(celsius=rxn_temp, **model_config)
 
 #<MODIFIABLE> On-target probability threshold
 threshold_ON = 0.7
